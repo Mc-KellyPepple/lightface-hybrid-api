@@ -4,14 +4,14 @@ import cv2,numpy as np,os
 
 cv2.setNumThreads(1)
 
-app=FastAPI(title="LightFace MobileFaceNet API",version="1.0.0")
+app=FastAPI(title="LightFace MobileFaceNet API",version="1.1.0")
 
 BASE=os.path.dirname(os.path.abspath(__file__))
 FACE_MODEL=os.path.join(BASE,"models","w600k_mbf.onnx")
 DETECT_MODEL=os.path.join(BASE,"models","face_detection_yunet_2023mar.onnx")
 
-# Recognition model intentionally NOT loaded yet.
-# This prevents w600k_mbf.onnx from consuming memory during startup.
+# MobileFaceNet intentionally NOT loaded yet.
+# Alignment is tested independently before loading the recognition model.
 
 detector=cv2.FaceDetectorYN.create(
     DETECT_MODEL,
@@ -22,12 +22,24 @@ detector=cv2.FaceDetectorYN.create(
     50
 )
 
+# Standard 5-point ArcFace-style 112x112 reference landmarks.
+REFERENCE_POINTS=np.array([
+    [38.2946,51.6963],
+    [73.5318,51.5014],
+    [56.0252,71.7366],
+    [41.5493,92.3655],
+    [70.7299,92.2041]
+],dtype=np.float32)
+
+
 @app.get("/")
 def root():
     return {
         "status":"ok",
-        "service":"LightFace MobileFaceNet API"
+        "service":"LightFace MobileFaceNet API",
+        "version":"1.1.0"
     }
+
 
 @app.get("/health")
 def health():
@@ -37,13 +49,17 @@ def health():
             "detection":os.path.exists(DETECT_MODEL),
             "recognition_file":os.path.exists(FACE_MODEL),
             "recognition_loaded":False
+        },
+        "alignment":{
+            "enabled":True,
+            "output_size":[112,112]
         }
     }
+
 
 def detect_faces(image):
     h,w=image.shape[:2]
 
-    # Limit detector input size to control memory usage.
     max_side=1280
     scale=min(1.0,max_side/max(h,w))
 
@@ -106,6 +122,34 @@ def detect_faces(image):
 
     return results
 
+
+def align_face(image,landmarks):
+    src=np.asarray(landmarks,dtype=np.float32)
+
+    if src.shape!=(5,2):
+        raise ValueError("Exactly 5 facial landmarks are required.")
+
+    transform,_=cv2.estimateAffinePartial2D(
+        src,
+        REFERENCE_POINTS,
+        method=cv2.LMEDS
+    )
+
+    if transform is None:
+        raise ValueError("Unable to calculate face alignment transform.")
+
+    aligned=cv2.warpAffine(
+        image,
+        transform,
+        (112,112),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0,0,0)
+    )
+
+    return aligned
+
+
 @app.post("/recognize")
 async def recognize(file:UploadFile=File(...)):
     data=await file.read()
@@ -122,6 +166,36 @@ async def recognize(file:UploadFile=File(...)):
         )
 
     faces=detect_faces(image)
+    aligned_faces=[]
+
+    for i,face in enumerate(faces):
+        try:
+            aligned=align_face(
+                image,
+                face["landmarks"]
+            )
+
+            aligned_faces.append({
+                "face_index":i,
+                "size":{
+                    "width":112,
+                    "height":112
+                },
+                "alignment":"5-point_similarity",
+                "status":"success"
+            })
+
+        except Exception as e:
+            aligned_faces.append({
+                "face_index":i,
+                "size":{
+                    "width":112,
+                    "height":112
+                },
+                "alignment":"5-point_similarity",
+                "status":"failed",
+                "error":str(e)
+            })
 
     return JSONResponse({
         "status":"success",
@@ -130,5 +204,10 @@ async def recognize(file:UploadFile=File(...)):
             "height":int(image.shape[0])
         },
         "face_count":len(faces),
-        "faces":faces
+        "faces":faces,
+        "aligned_faces":aligned_faces,
+        "recognition":{
+            "loaded":False,
+            "embedding_generated":False
+        }
     })
