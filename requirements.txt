@@ -1,3 +1,5 @@
+fastapi
+uvicorn[standard]
 onnxruntime
-opencv-python
-numpy
+opencv-python-headless
+numpy<2
