@@ -1,18 +1,16 @@
 from fastapi import FastAPI,File,UploadFile,HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse,Response
 import cv2,numpy as np,os
 
 cv2.setNumThreads(1)
 
-app=FastAPI(title="LightFace MobileFaceNet API",version="1.1.0")
+app=FastAPI(title="LightFace MobileFaceNet API",version="1.2.0")
 
 BASE=os.path.dirname(os.path.abspath(__file__))
 FACE_MODEL=os.path.join(BASE,"models","w600k_mbf.onnx")
 DETECT_MODEL=os.path.join(BASE,"models","face_detection_yunet_2023mar.onnx")
 
 # MobileFaceNet intentionally NOT loaded yet.
-# Alignment is tested independently before loading the recognition model.
-
 detector=cv2.FaceDetectorYN.create(
     DETECT_MODEL,
     "",
@@ -22,7 +20,6 @@ detector=cv2.FaceDetectorYN.create(
     50
 )
 
-# Standard 5-point ArcFace-style 112x112 reference landmarks.
 REFERENCE_POINTS=np.array([
     [38.2946,51.6963],
     [73.5318,51.5014],
@@ -37,7 +34,7 @@ def root():
     return {
         "status":"ok",
         "service":"LightFace MobileFaceNet API",
-        "version":"1.1.0"
+        "version":"1.2.0"
     }
 
 
@@ -86,7 +83,6 @@ def detect_faces(image):
 
     for face in faces:
         x,y,bw,bh=map(float,face[:4])
-        confidence=float(face[-1])
 
         results.append({
             "box":[
@@ -95,28 +91,13 @@ def detect_faces(image):
                 min(w,int((x+bw)*sx)),
                 min(h,int((y+bh)*sy))
             ],
-            "confidence":round(confidence,4),
+            "confidence":round(float(face[-1]),4),
             "landmarks":[
-                [
-                    round(float(face[4])*sx,2),
-                    round(float(face[5])*sy,2)
-                ],
-                [
-                    round(float(face[6])*sx,2),
-                    round(float(face[7])*sy,2)
-                ],
-                [
-                    round(float(face[8])*sx,2),
-                    round(float(face[9])*sy,2)
-                ],
-                [
-                    round(float(face[10])*sx,2),
-                    round(float(face[11])*sy,2)
-                ],
-                [
-                    round(float(face[12])*sx,2),
-                    round(float(face[13])*sy,2)
-                ]
+                [round(float(face[4])*sx,2),round(float(face[5])*sy,2)],
+                [round(float(face[6])*sx,2),round(float(face[7])*sy,2)],
+                [round(float(face[8])*sx,2),round(float(face[9])*sy,2)],
+                [round(float(face[10])*sx,2),round(float(face[11])*sy,2)],
+                [round(float(face[12])*sx,2),round(float(face[13])*sy,2)]
             ]
         })
 
@@ -138,7 +119,7 @@ def align_face(image,landmarks):
     if transform is None:
         raise ValueError("Unable to calculate face alignment transform.")
 
-    aligned=cv2.warpAffine(
+    return cv2.warpAffine(
         image,
         transform,
         (112,112),
@@ -147,11 +128,8 @@ def align_face(image,landmarks):
         borderValue=(0,0,0)
     )
 
-    return aligned
 
-
-@app.post("/recognize")
-async def recognize(file:UploadFile=File(...)):
+async def decode_upload(file):
     data=await file.read()
 
     image=cv2.imdecode(
@@ -165,12 +143,69 @@ async def recognize(file:UploadFile=File(...)):
             detail="Invalid image"
         )
 
+    return image
+
+
+@app.post("/align")
+async def align(file:UploadFile=File(...)):
+    image=await decode_upload(file)
     faces=detect_faces(image)
+
+    if not faces:
+        raise HTTPException(
+            status_code=404,
+            detail="No face detected."
+        )
+
+    # Use the highest-confidence detected face.
+    face=max(
+        faces,
+        key=lambda x:x["confidence"]
+    )
+
+    try:
+        aligned=align_face(
+            image,
+            face["landmarks"]
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Face alignment failed: {e}"
+        )
+
+    ok,encoded=cv2.imencode(
+        ".jpg",
+        aligned,
+        [cv2.IMWRITE_JPEG_QUALITY,95]
+    )
+
+    if not ok:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not encode aligned face."
+        )
+
+    return Response(
+        content=encoded.tobytes(),
+        media_type="image/jpeg",
+        headers={
+            "X-Face-Confidence":str(face["confidence"]),
+            "X-Aligned-Size":"112x112"
+        }
+    )
+
+
+@app.post("/recognize")
+async def recognize(file:UploadFile=File(...)):
+    image=await decode_upload(file)
+    faces=detect_faces(image)
+
     aligned_faces=[]
 
     for i,face in enumerate(faces):
         try:
-            aligned=align_face(
+            align_face(
                 image,
                 face["landmarks"]
             )
